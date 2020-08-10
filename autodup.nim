@@ -1,6 +1,19 @@
-import os, osproc, strutils, tables, times
+import os, strutils, tables, terminal, times
 
-import cligen, regex, weave
+import cligen, meow, regex
+
+when defined(weave):
+  import weave
+else:
+  import macros, threadpool
+
+  macro syncScope(body: untyped): untyped =
+    result = body
+
+template ercho(str: untyped) =
+  stdout.eraseLine()
+  stdout.write(str)
+  stdout.flushFile()
 
 type
   State = ref object
@@ -18,12 +31,20 @@ type
     invert: string
     quiet: bool
 
-  Process = tuple[path, value: string]
+  Process = ref object
+    path: string
+    size: BiggestInt
+    value: string
+
+  First = ref object
+    path: string
+    hashed: bool
 
 var
+  SizeMap {.threadvar.}: Table[BiggestInt, First]
   HashMap: Table[string, string]
   chProcess: Channel[Process]
-  chRecurse: Channel[bool]
+  chRecurse: Channel[int]
 chProcess.open()
 chRecurse.open()
 
@@ -36,17 +57,17 @@ proc moveaction(path, dupdir: string) =
     createDir(parentDir(dest))
     moveFile(path, dest)
   except:
-    echo "Already exists " & dest
+    ercho "Already exists " & dest
 
 proc removeaction(path: string, kind: PathComponent) =
   if kind == pcFile:
     if not tryRemoveFile(path):
-      echo "Failed to remove " & path
+      ercho "Failed to remove " & path
   elif kind == pcDir:
     try:
       removeDir(path)
     except:
-      echo "Failed to remove dir " & path
+      ercho "Failed to remove dir " & path
 
 proc action(state: State, path: string, orig = "") =
   var
@@ -64,17 +85,17 @@ proc action(state: State, path: string, orig = "") =
     var outp = action & path
     if orig != "":
       outp &= " == " & orig
-    echo outp
+    ercho outp & "\n"
 
 # Checks
 
-proc getHash(state: State, path: string) =
-  let
-    outp = execCmdEx("openssl sha512 " & path).output
-    hash = outp[outp.find(' ') .. ^2]
-  chProcess.send((path, hash))
+proc getHash(state: State, path: string, size: BiggestInt) =
+  ercho "Hashing " & path
+  let process =
+    Process(path: path, size: size, value: $MeowFile(path))
+  chProcess.send(process)
 
-proc getFingerprint(state: State, path: string) =
+proc getFingerprint(state: State, path: string, size: BiggestInt) =
   discard
 
 proc getEmpty(state: State, path: string) =
@@ -82,7 +103,7 @@ proc getEmpty(state: State, path: string) =
 
 # Filter
 
-proc recurse(state: State, source: string) =
+proc recurse(state: State, sources: seq[string]) =
   let
     now = getTime()
     after = now - initTimeInterval(days=state.after)
@@ -103,54 +124,73 @@ proc recurse(state: State, source: string) =
     elif condition and flag in state.invert:
       continue
 
+  template processPath(path, size: untyped) =
+    ercho "Checking " & path
+    processed.inc()
+    if state.duplicate:
+      spawn state.getHash(path, size)
+    elif state.music:
+      spawn state.getFingerprint(path, size)
+    elif state.empty:
+      spawn state.getEmpty(path)
+
+  var
+    total = 0
+    processed = 0
   syncScope():
-    for path in walkDirRec(source, yieldFilter = {filter}):
-      # count += 1
+    for source in sources:
+      for path in walkDirRec(source, yieldFilter = {filter}):
+        let
+          fname = path.extractFilename()
+          info = path.getFileInfo()
 
-      let
-        fname = path.extractFilename()
-        info = path.getFileInfo()
+        if state.pattern.len != 0:
+          # Pattern check
+          checkCondition fname.contains(state.pattern), 'p'
 
-      if state.pattern.len != 0:
-        # Pattern check
-        checkCondition fname.contains(state.pattern), 'p'
+        if state.patternfull.len != 0:
+          # Pattern check
+          checkCondition path.contains(state.patternfull), 'P'
 
-      if state.patternfull.len != 0:
-        # Pattern check
-        checkCondition path.contains(state.patternfull), 'P'
+        if state.regex.len != 0:
+          # Regex check
+          checkCondition fname.contains(state.cregex), 'r'
 
-      if state.regex.len != 0:
-        # Regex check
-        checkCondition fname.contains(state.cregex), 'r'
+        if state.regexfull.len != 0:
+          # Regex check
+          checkCondition path.contains(state.cregexfull), 'R'
 
-      if state.regexfull.len != 0:
-        # Regex check
-        checkCondition path.contains(state.cregexfull), 'R'
+        if state.greater != 0:
+          # Size check
+          checkCondition info.size > state.greater, 'g'
 
-      if state.greater != 0:
-        # Size check
-        checkCondition info.size > state.greater, 'g'
+        if state.lesser != 0:
+          # Size check
+          checkCondition info.size < state.lesser, 'l'
 
-      if state.lesser != 0:
-        # Size check
-        checkCondition info.size < state.lesser, 'l'
+        if state.after != 0:
+          # Date check
+          checkCondition info.lastWriteTime > after, 'a'
 
-      if state.after != 0:
-        # Date check
-        checkCondition info.lastWriteTime > after, 'a'
+        if state.before != 0:
+          # Date check
+          checkCondition info.lastWriteTime < before, 'b'
 
-      if state.before != 0:
-        # Date check
-        checkCondition info.lastWriteTime < before, 'b'
+        total.inc()
+        if not SizeMap.hasKey(info.size):
+          # First of size, hash later
+          SizeMap[info.size] = First(path: path)
+          continue
+        else:
+          if not SizeMap[info.size].hashed:
+            # Second of size, hash first
+            processPath(SizeMap[info.size].path, info.size)
+            SizeMap[info.size].hashed = true
 
-      if state.duplicate:
-        spawn state.getHash(path)
-      elif state.music:
-        spawn state.getFingerprint(path)
-      elif state.empty:
-        spawn state.getEmpty(path)
+        processPath(path, info.size)
 
-  chRecurse.send(true)
+  chRecurse.send(total)
+  chRecurse.send(processed)
 
 proc main(
   duplicate = false, empty = false, music = false,
@@ -207,27 +247,47 @@ proc main(
   elif state.empty:
     state.kind = pcDir
 
+  var
+    received = 0
+    matches = 0
+    total = -1
+    processed = -1
+    size: BiggestInt = 0
   syncScope():
-    var done = 0
-    for source in sources:
-      spawn state.recurse(source)
+    spawn state.recurse(sources)
 
     while true:
       # Break on done
-      let (rdy, msg) = chRecurse.tryRecv()
-      if rdy: done.inc()
-      if done == sources.len: break
+      if total == -1:
+        let (rdy, val) = chRecurse.tryRecv()
+        if rdy: total = val
+      elif processed == -1:
+        let (rdy, val) = chRecurse.tryRecv()
+        if rdy: processed = val
+      elif processed == received:
+        break
 
       let (todo, process) = chProcess.tryRecv()
       if todo:
-        if HashMap.hasKey(process[1]):
-          #echo process[0] & " is a dup of " & HashMap[process[1]]
-          state.action(process[0], HashMap[process[1]])
+        received.inc()
+        if HashMap.hasKey(process.value):
+          state.action(process.path, HashMap[process.value])
+          matches.inc()
+          size += process.size
         else:
-          HashMap[process[1]] = process[0]
+          HashMap[process.value] = process.path
+
+  when not defined(weave):
+    sync()
+
+  if state.duplicate:
+    ercho "Hashed " & $received & " / " & $total & " files, " &
+      $matches & " duplicate(s) found (" &
+      formatFloat(float(size)/1024/1024, ffDecimal, 2) & " MB)"
 
 when isMainModule:
-  init(Weave)
+  when defined(weave):
+    init(Weave)
   dispatch(main,
     help = {
       "duplicate": "search for duplicate files",
@@ -266,4 +326,5 @@ when isMainModule:
       "quiet": 'q'
     }
   )
-  exit(Weave)
+  when defined(weave):
+    exit(Weave)
