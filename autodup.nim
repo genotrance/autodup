@@ -2,6 +2,8 @@ import os, strutils, tables, terminal, times
 
 import cligen, meow, regex
 
+import nimpcre
+
 when defined(weave):
   import weave
 else:
