@@ -94,7 +94,7 @@ proc action(state: State, path: string, orig = "") =
 proc getHash(state: State, path: string, size: BiggestInt) =
   ercho "Hashing " & path
   let process =
-    Process(path: path, size: size, value: $MeowFile(path))
+    Process(path: path, size: size, value: $meowFile(path))
   chProcess.send(process)
 
 proc getFingerprint(state: State, path: string, size: BiggestInt) =
